@@ -1,5 +1,7 @@
 *.mp4
-
+inf_data/*
+model/chinese-hubert-large/*
+benchmark_real_output/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -208,3 +210,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+config.py

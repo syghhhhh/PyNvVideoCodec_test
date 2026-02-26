@@ -16,7 +16,8 @@ import datetime
 import traceback
 import numpy as np
 from glob import glob
-from moviepy.editor import VideoFileClip
+# from moviepy.editor import VideoFileClip
+from moviepy.video.io.VideoFileClip import VideoFileClip
 from PIL import ImageFont, ImageDraw, Image
 import librosa
 import soundfile as sf
@@ -26,6 +27,7 @@ from transformers import (
 )
 
 from config import parameters
+import torch
 from utils.callback import callback_merge, callback_base_task
 from utils.file_transfer import download_requests
 from utils.pre_picture_merge import get_correct_coordinates

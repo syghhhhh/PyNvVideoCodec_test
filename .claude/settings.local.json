@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir H:\\\\PyNvVideoCodec_test\\\\inf_data\\\\0203:*)",
+      "Bash(dir H:\\\\PyNvVideoCodec_test:*)",
+      "Bash(ffprobe:*)"
+    ]
+  }
+}

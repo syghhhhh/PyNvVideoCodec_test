@@ -4,6 +4,55 @@
 # @File    : video_merge.py
 from utils.data_prepare import *
 from utils.file_transfer import upload_oss
+import subprocess
+
+
+class GpuNV12FramePool:
+    """预分配 GPU 内存池，用于 PyNvVideoCodec GPU Buffer 模式"""
+
+    def __init__(self, width, height):
+        import cupy as cp
+        self.width = width
+        self.height = height
+        y_size = height * width
+        uv_size = (height // 2) * width
+        self._buf = cp.empty(y_size + uv_size, dtype=cp.uint8)
+        self.y_plane = self._buf[:y_size].reshape(height, width, 1)
+        self.uv_plane = self._buf[y_size:].reshape(height // 2, width // 2, 2)
+
+    def update_from_rgba(self, rgba_tensor):
+        """从 RGBA tensor 更新 NV12 数据 (RGB 输入)"""
+        import cupy as cp
+
+        height, width = self.height, self.width
+
+        # 输入是 (1, 4, H, W) RGBA, float32 [0, 1]
+        r = (rgba_tensor[0, 0, :, :] * 255).float()
+        g = (rgba_tensor[0, 1, :, :] * 255).float()
+        b = (rgba_tensor[0, 2, :, :] * 255).float()
+
+        # BT.601 Full Range RGB -> YUV
+        y = ( 0.299 * r + 0.587 * g + 0.114 * b).clamp(0, 255).to(torch.uint8)
+        u = (-0.169 * r - 0.331 * g + 0.500 * b + 128).clamp(0, 255).to(torch.uint8)
+        v = ( 0.500 * r - 0.419 * g - 0.081 * b + 128).clamp(0, 255).to(torch.uint8)
+
+        y_cp = cp.asarray(y)
+        u_cp = cp.asarray(u)
+        v_cp = cp.asarray(v)
+
+        # Y 平面
+        y_size = height * width
+        self._buf[:y_size] = y_cp.flatten()
+
+        # UV 交织平面
+        uv = self._buf[y_size:].reshape(height // 2, width)
+        uv[:, 0::2] = v_cp[::2, ::2]  # V 在偶数位置
+        uv[:, 1::2] = u_cp[::2, ::2]  # U 在奇数位置
+
+        return self
+
+    def cuda(self):
+        return [self.y_plane, self.uv_plane]
 
 
 def merge_video(item, id_merge, ret_dict, config_dict, log_file):
@@ -117,8 +166,46 @@ def merge_video(item, id_merge, ret_dict, config_dict, log_file):
         # 单个任务
         start_human_frame = 0
 
-    # 开始合成
-    videowriter = cv2.VideoWriter(join(merge_folder, "speaker_25fps_16k_merged.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), 25, (width, height))
+    # 开始合成 - 使用 PyNvVideoCodec GPU 编码
+    import PyNvVideoCodec as nvc
+
+    # 解析码率
+    bitrate_str = str(item.bitRate) if hasattr(item, 'bitRate') else '16M'
+    bitrate_value = bitrate_str.upper()
+    if bitrate_value.endswith('M'):
+        bitrate_num = int(float(bitrate_value[:-1]) * 1_000_000)
+    elif bitrate_value.endswith('K'):
+        bitrate_num = int(float(bitrate_value[:-1]) * 1_000)
+    else:
+        bitrate_num = int(bitrate_value)
+
+    # 创建编码器
+    nvenc = nvc.CreateEncoder(
+        width=width,
+        height=height,
+        fmt="NV12",
+        usecpuinputbuffer=False,
+        gpu_id=0,
+        codec="h264",
+        fps=25,
+        bitrate=bitrate_num,
+        maxbitrate=int(bitrate_num * 1.5),
+        preset="P1",
+        tuning_info="high_quality",
+        profile="high",
+        rc="vbr",
+        gop=50,
+    )
+
+    # 预分配 GPU 内存池
+    frame_pool = GpuNV12FramePool(width, height)
+
+    # 临时 H264 文件路径
+    h264_path = join(merge_folder, "speaker_25fps_16k_merged.h264")
+    mp4_path = join(merge_folder, "speaker_25fps_16k_merged.mp4")
+
+    # 打开 H264 文件用于写入
+    h264_file = open(h264_path, "wb")
 
     # 如果背景为图片,则只需处理一次滤镜
     bool_videoFilter = (len(item.videoFilter) > 0)
@@ -189,16 +276,38 @@ def merge_video(item, id_merge, ret_dict, config_dict, log_file):
         #     if 0 <= i < 5 * 25:
         #         frame = merge_bg_add(frame, watermark_wenzi_tensor, [0, watermark_wenzi_w, 0, watermark_wenzi_h], [0, watermark_wenzi_w, 0, watermark_wenzi_h])
         # log_content_write(log_file, f'end watermark, frame.shape = {frame.shape}')
-        # frame转回cv2格式,并去除alpha层的信息
-        frame = frame.squeeze().permute(1, 2, 0).cpu().numpy() * 255
-        frame = frame.astype(np.uint8)[..., :3]
-        # log_content_write(log_file, f'end frame, frame.shape = {frame.shape}, frame: {frame}')
         # ----------------------------------------------------保存第一张预览图----------------------------------------------------
         if (not config_dict['child']) or (config_dict['child'] and config_dict['last_child']):
             if i == 0:
-                cv2.imwrite(join(merge_folder, 'first_frame.jpg'), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-        videowriter.write(frame)
-    videowriter.release()
+                # frame 转回 cv2 格式用于保存预览图
+                frame_preview = frame.squeeze().permute(1, 2, 0).cpu().numpy() * 255
+                frame_preview = frame_preview.astype(np.uint8)[..., :3]
+                cv2.imwrite(join(merge_folder, 'first_frame.jpg'), frame_preview, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+
+        # 使用 GPU 编码 (无需 GPU->CPU 传输)
+        gpu_nv12_frame = frame_pool.update_from_rgba(frame)
+        bitstream = nvenc.Encode(gpu_nv12_frame)
+        if bitstream:
+            h264_file.write(bytearray(bitstream))
+
+    # 刷新编码器
+    bitstream = nvenc.EndEncode()
+    if bitstream:
+        h264_file.write(bytearray(bitstream))
+    h264_file.close()
+
+    # 封装 MP4
+    log_content_write(log_file, 'start ffmpeg muxing to mp4')
+    subprocess.run([
+        "ffmpeg", "-y", "-framerate", "25",
+        "-i", h264_path, "-c:v", "copy", "-movflags", "+faststart",
+        mp4_path, "-loglevel", "quiet"
+    ], check=True)
+
+    # 删除临时 H264 文件
+    if exists(h264_path):
+        os.remove(h264_path)
+
     duration = frame_num / 25
     return duration
 
