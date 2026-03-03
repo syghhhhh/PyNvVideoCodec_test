@@ -20,7 +20,7 @@ class GpuNV12FramePool:
         self.y_plane = self._buf[:y_size].reshape(height, width, 1)
         self.uv_plane = self._buf[y_size:].reshape(height // 2, width // 2, 2)
 
-    def update_from_rgba(self, rgba_tensor):
+    def _update_from_rgba(self, rgba_tensor):
         """从 RGBA tensor 更新 NV12 数据 (RGB 输入)"""
         import cupy as cp
 
@@ -31,10 +31,18 @@ class GpuNV12FramePool:
         g = (rgba_tensor[0, 1, :, :] * 255).float()
         b = (rgba_tensor[0, 2, :, :] * 255).float()
 
-        # BT.601 Full Range RGB -> YUV
-        y = ( 0.299 * r + 0.587 * g + 0.114 * b).clamp(0, 255).to(torch.uint8)
-        u = (-0.169 * r - 0.331 * g + 0.500 * b + 128).clamp(0, 255).to(torch.uint8)
-        v = ( 0.500 * r - 0.419 * g - 0.081 * b + 128).clamp(0, 255).to(torch.uint8)
+        # # BT.601 Full Range RGB -> YUV
+        # y = ( 0.299 * r + 0.587 * g + 0.114 * b).clamp(0, 255).to(torch.uint8)
+        # u = (-0.169 * r - 0.331 * g + 0.500 * b + 128).clamp(0, 255).to(torch.uint8)
+        # v = ( 0.500 * r - 0.419 * g - 0.081 * b + 128).clamp(0, 255).to(torch.uint8)
+        # # BT.601 Limited Range 简化版
+        # y = ( 0.257 * r + 0.504 * g + 0.098 * b +  16).clamp(16, 235).to(torch.uint8)
+        # u = (-0.148 * r - 0.291 * g + 0.439 * b + 128).clamp(16, 240).to(torch.uint8)
+        # v = ( 0.439 * r - 0.368 * g - 0.071 * b + 128).clamp(16, 240).to(torch.uint8)
+        # BT.709 Limited Range
+        y = ( 0.183 * r + 0.614 * g + 0.062 * b +  16).clamp(16, 235).to(torch.uint8)
+        u = (-0.101 * r - 0.339 * g + 0.439 * b + 128).clamp(16, 240).to(torch.uint8)
+        v = ( 0.439 * r - 0.399 * g - 0.040 * b + 128).clamp(16, 240).to(torch.uint8)
 
         y_cp = cp.asarray(y)
         u_cp = cp.asarray(u)
@@ -48,6 +56,49 @@ class GpuNV12FramePool:
         uv = self._buf[y_size:].reshape(height // 2, width)
         uv[:, 0::2] = v_cp[::2, ::2]  # V 在偶数位置
         uv[:, 1::2] = u_cp[::2, ::2]  # U 在奇数位置
+
+        return self
+    
+    def update_from_rgba(self, rgba_tensor):
+        import cupy as cp
+        import torch
+        import torch.utils.dlpack
+
+        H, W = self.height, self.width
+
+        # rgba_tensor: (1, 4, H, W), float32, [0,1], CUDA
+        rgb = (rgba_tensor[0, :3] * 255.0).clamp(0, 255)  # (3,H,W)
+
+        # 如果你的 get_frame_tensor 实际给的是 BGR/BGRA，请用下面替换：
+        # b = rgb[0]; g = rgb[1]; r = rgb[2]
+        r, g, b = rgb[0], rgb[1], rgb[2]
+
+        # BT.709 limited range (R'G'B' -> Y'CbCr)
+        y = (16.0  + 0.182586*r + 0.614231*g + 0.062007*b).round().clamp(16, 235).to(torch.uint8)
+        u = (128.0 - 0.100644*r - 0.338572*g + 0.439216*b).round().clamp(16, 240).to(torch.uint8)
+        v = (128.0 + 0.439216*r - 0.398942*g - 0.040274*b).round().clamp(16, 240).to(torch.uint8)
+
+        # 4:2:0 下采样：2x2 平均（比直接 ::2 更接近标准）
+        u16 = u.to(torch.int16)
+        v16 = v.to(torch.int16)
+        u420 = ((u16[0::2, 0::2] + u16[1::2, 0::2] + u16[0::2, 1::2] + u16[1::2, 1::2] + 2) // 4).to(torch.uint8)
+        v420 = ((v16[0::2, 0::2] + v16[1::2, 0::2] + v16[0::2, 1::2] + v16[1::2, 1::2] + 2) // 4).to(torch.uint8)
+
+        # Torch(CUDA) -> CuPy 尽量走 DLPack（避免隐式拷贝/下CPU）
+        y_cp = cp.fromDlpack(torch.utils.dlpack.to_dlpack(y))
+        u_cp = cp.fromDlpack(torch.utils.dlpack.to_dlpack(u420))
+        v_cp = cp.fromDlpack(torch.utils.dlpack.to_dlpack(v420))
+
+        # 写 Y
+        y_size = H * W
+        self._buf[:y_size] = y_cp.reshape(-1)
+
+        # 写 UV（NV12: U在前，V在后）
+        uv = self._buf[y_size:].reshape(H // 2, W)
+        u2 = u_cp.reshape(H // 2, W // 2)
+        v2 = v_cp.reshape(H // 2, W // 2)
+        uv[:, 0::2] = v2
+        uv[:, 1::2] = u2
 
         return self
 
@@ -297,10 +348,20 @@ def merge_video(item, id_merge, ret_dict, config_dict, log_file):
     h264_file.close()
 
     # 封装 MP4
-    log_content_write(log_file, 'start ffmpeg muxing to mp4')
+    # log_content_write(log_file, 'start ffmpeg muxing to mp4')
+    # subprocess.run([
+    #     "ffmpeg", "-y", "-framerate", "25",
+    #     "-i", h264_path, "-c:v", "copy", "-movflags", "+faststart",
+    #     mp4_path, "-loglevel", "quiet"
+    # ], check=True)
     subprocess.run([
         "ffmpeg", "-y", "-framerate", "25",
-        "-i", h264_path, "-c:v", "copy", "-movflags", "+faststart",
+        "-i", h264_path,
+        "-c:v", "copy",
+        "-colorspace", "bt709",
+        "-color_primaries", "bt709", 
+        "-color_trc", "bt709",
+        "-movflags", "+faststart",
         mp4_path, "-loglevel", "quiet"
     ], check=True)
 

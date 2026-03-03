@@ -2,6 +2,9 @@
 inf_data/*
 model/chinese-hubert-large/*
 benchmark_real_output/*
+compare_out/*
+color_test_output/*
+*.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
